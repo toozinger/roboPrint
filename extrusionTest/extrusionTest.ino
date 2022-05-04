@@ -5,22 +5,24 @@
 
 #include "QuickPID.h"
 #include <Wire.h>
-#include <Adafruit_ADS1X15.h>
+#include <SPI.h>
+#include "Adafruit_MAX31855.h"
 #include <ESP_FlexyStepper.h> //https://github.com/pkerspe/ESP-FlexyStepper
 
-Adafruit_ADS1115 ads1115; // Construct an ads1115
-const float multiplier = 0.1875F;
-//const float fiveTo3Mofier = 5/3.3F;
-float inputVoltage = 0;
-float tempC = 0;
-int16_t adc0;
 
 // Motor I/O Pin assignments
 const int MOTOR_STEP_PIN = 26;
 const int MOTOR_DIRECTION_PIN = 33;
 const int LED_PIN = 13;
 
-
+// Thermocouple 
+const int PIN_TC_DO = 19;
+const int PIN_TC_CS = 15;
+const int PIN_TC_CLK = 18;
+float tempC = 0;
+Adafruit_MAX31855 TC(PIN_TC_CLK, PIN_TC_CS, PIN_TC_DO);
+const long TCreadSpeed = 1 * pow(10,6);       // Time in microseconds between reading TC
+unsigned long lastTCread;
 
 // Heater PWM setup
 const int PWMFreq = 5; //
@@ -28,7 +30,7 @@ const int PWMChannel = 0;
 const int PWMResolution = 10;
 const int MAX_DUTY_CYCLE = (int)(pow(2, PWMResolution) - 1);
 
-// Communication
+// Serial communication
 const byte numChars = 32;
 char receivedChars[numChars];   // Stores incoming characters from serial
 char controlString[numChars];   // Stores string instructions from python
@@ -37,44 +39,38 @@ float controlFloat;             // Stores float values
 bool newData = false;        // Stores when new data is read from serial
 bool sendData = false;       // Used as flag to request current status be sent asap
 bool moveStarted = false;     // Flag to know if a move has been started
-
-// Control
-const long TCreportSpeed  = 1 * pow(10, 6); //Time in microseconds between printing TC values
+const long serialPrintSpeed  = 1 * pow(10,6); // Time in microseconds between printing to serial
+unsigned long lastSerialSent;
 bool debug = false;
-unsigned long lastTCSent;
 
-#define PIN_OUTPUT 14
 
 // Temp controller
 float tSetPoint, Output;
+const int PIN_OUTPUT = 14;
 
-float Kp = 125;  // oldest 25
-float Ki = 3.0;        // oldes: 10, old: 0.3
+float Kp = 5; // 125  // oldest 25
+float Ki = 2.0; //3        // oldes: 10, old: 0.3
 float Kd = 0.1;        // oldes 0.5
 
-#define MAX_TEMP 250   // Max temp allowable
-#define MIN_TEMP 0     // Min temp allowable
+const int MAX_TEMP  = 250;   // Max temp allowable
+const int MIN_TEMP = 0;     // Min temp allowable
 
-//Specify PID links
+//Specify PID 
 QuickPID myPID(&tempC, &Output, &tSetPoint);
 
 // Stepper setup
 ESP_FlexyStepper stepper;
-//#define GEAR_RATIO 3.32
 #define STEPS_PER_MM 393
-//#define MICROSTEPPING 3200
+
 long acceleration = 100;        // mm/s^2
 long stepperPosition = 0;
-long motorSpeed = 1;          // mm/s
+float motorSpeed = 1;          // mm/s
 char movingStatus[10];        // Char array holding "true" or "false"
 
 void setup()
 {
 
   Serial.begin(115200);
-
-  ads1115.begin(0x48);  // Initialize ads1115 at address
-  //initialize the variables we're linked to
 
   //apply PID gains
   myPID.SetTunings(Kp, Ki, Kd);
@@ -140,7 +136,7 @@ void loop()
   }
 
   // Update tSetPoint if requested
-  if ((strcmp(controlString, "TSET") == 0) && (newData == true)) {
+  if ((strcmp(controlString, "SETTEMP") == 0) && (newData == true)) {
 
     if ((controlFloat > MAX_TEMP) || (controlFloat < MIN_TEMP)) {
       Serial.print("Requested set temp: "); Serial.print(controlFloat); Serial.println(" is out of allowable range");
@@ -148,6 +144,7 @@ void loop()
     else {
       tSetPoint = controlFloat;
       Serial.print("New set point: "); Serial.print(controlFloat); Serial.println("");
+      sendData = true;
     }
   }
 
@@ -182,35 +179,34 @@ void loop()
   }
 
   // Update motorSpeed
-  if ((strcmp(controlString, "SPEED") == 0) && (newData == true)) {
+  if ((strcmp(controlString, "SETSPEED") == 0) && (newData == true)) {
     motorSpeed = controlFloat;
     stepper.setSpeedInMillimetersPerSecond(motorSpeed);
     Serial.print("New motor speed: "); Serial.print(controlFloat); Serial.println("");
   }
 
-  // Print current motorSpeed
-  if ((strcmp(controlString, "SPEEDX") == 0) && (newData == true)) {
-    Serial.print("Motor speed: "); Serial.print(motorSpeed); Serial.println("");
-  }
-
   // Update Acceleration
-  if ((strcmp(controlString, "ACCEL") == 0) && (newData == true)) {
+  if ((strcmp(controlString, "SETACCEL") == 0) && (newData == true)) {
     acceleration = controlFloat;
     stepper.setAccelerationInStepsPerSecondPerSecond(acceleration);
     stepper.setDecelerationInStepsPerSecondPerSecond(acceleration);
     Serial.print("New acceleration set: "); Serial.print(controlFloat); Serial.println("");
   }
 
-  // Print current Acceleration
-  if ((strcmp(controlString, "ACCELX") == 0) && (newData == true)) {
-    Serial.print("Acceleration set at: "); Serial.print(acceleration); Serial.println("");
-  }
-
-  // Move motor
+  // Increment move motor
   if ((strcmp(controlString, "MOVE") == 0) && (newData == true)) {
     stepperPosition += controlFloat;
     Serial.print("Moving "); Serial.print(controlFloat); Serial.print(" mm to position: "); Serial.print(stepperPosition); Serial.print(" mm"); Serial.println("");
     stepper.setTargetPositionRelativeInMillimeters(controlFloat);
+    sendData = true; // Assures new info will be sent next time
+    moveStarted = true;
+  }
+
+   // Absolute move motor
+  if ((strcmp(controlString, "SETTARGET") == 0) && (newData == true)) {
+    stepperPosition = controlFloat;
+    Serial.print("Moving to position "); Serial.print(controlFloat); Serial.print(" [mm]"); Serial.println("");
+    stepper.setTargetPositionInMillimeters(controlFloat);
     sendData = true; // Assures new info will be sent next time
     moveStarted = true;
   }
@@ -220,7 +216,6 @@ void loop()
     Serial.print("Current location set as home"); Serial.println("");
     stepper.setCurrentPositionAsHomeAndStop();
   }
-
 
   // Check status of movement
   if (stepper.motionComplete() == 0) {
@@ -237,35 +232,35 @@ void loop()
     }
   }
 
-
   // Stop motor
   if ((strcmp(controlString, "STOP") == 0) && (newData == true)) {
     Serial.print("Stopping!"); Serial.println("");
     stepper.setTargetPositionToStop();
   }
 
+  // Read temp sensor every set amount of time
+  if ((micros() - lastTCread) > TCreadSpeed) {
+    float TCread = TC.readCelsius();
 
-
-  adc0 = ads1115.readADC_SingleEnded(0);
-  inputVoltage = adc0 * multiplier; //
-
-  // Copied from Excel 2nd order interpolation from raw data provided here: https://e3d-online.zendesk.com/hc/en-us/articles/360017153677-E3D-PT100-Amplifier-Guide
-  // tempC = 2*pow(10,-8)*pow(inputVoltage,3) - 9*pow(10,-5)*pow(inputVoltage,2) + 0.2148*inputVoltage - 176.86;
-  tempC = 4.46 * pow(10, -5) * pow(inputVoltage, 2) - 0.0485 * inputVoltage + 15.545;
-
+    // Only saves TC value if valid reading taken
+    if (!isnan(TCread)) {
+      tempC = TCread;
+    } 
+    lastTCread = micros();
+  }
 
   // Update serial with info every set amount of time
-  if (((micros() - lastTCSent) > TCreportSpeed) || (sendData)) {
-    Serial.print("TempSet "); Serial.print(tSetPoint); Serial.print(" [C],");
-    Serial.print(" TempAct "); Serial.print(tempC); Serial.print(" [C],");
-    //    Serial.print(" Voltage, "); Serial.print(inputVoltage); Serial.print(" [V],");
-    Serial.print(" Duty Cycle "); Serial.print(float(Output / MAX_DUTY_CYCLE * 100)); Serial.print(" [%],");
-    Serial.print(" Position "); Serial.print(stepper.getCurrentPositionInMillimeters()); Serial.print(" [mm],");
-    Serial.print(" SetSpeed "); Serial.print(motorSpeed); Serial.print(" [mm/s],");
-    Serial.print(" SetAccel "); Serial.print(acceleration); Serial.print(" [mm/s/s],");
-    Serial.print(" movingStatus: "); Serial.print(movingStatus); Serial.print(" [T/F],");
+  if (((micros() - lastSerialSent) > serialPrintSpeed) || (sendData)) {
+    Serial.print("SetT, "); Serial.print(tSetPoint); Serial.print(", [C],");
+    Serial.print(" ActT, "); Serial.print(tempC); Serial.print(", [C],");
+    //    Serial.print(" Voltage, "); Serial.print(inputVoltage); Serial.print(", [V],");
+    Serial.print(" Heater, "); Serial.print(float(Output / MAX_DUTY_CYCLE * 100)); Serial.print(", [%],");
+    Serial.print(" Pos, "); Serial.print(stepper.getCurrentPositionInMillimeters()); Serial.print(", [mm],");
+    Serial.print(" Speed, "); Serial.print(motorSpeed); Serial.print(", [mm/s],");
+    Serial.print(" Accel, "); Serial.print(acceleration); Serial.print(", [mm/s/s],");
+    Serial.print(" target dist, "); Serial.print((stepper.getDistanceToTargetSigned()/float(STEPS_PER_MM))); Serial.print(", [mm],");
     Serial.println("");
-    lastTCSent = micros();
+    lastSerialSent = micros();
     sendData = false;
   }
 

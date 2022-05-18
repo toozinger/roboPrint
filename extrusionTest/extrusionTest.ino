@@ -1,8 +1,3 @@
-/********************************************************
-   PID Basic Example
-   Reading analog input 0 to control analog PWM output 3
- ********************************************************/
-
 #include "QuickPID.h"
 #include <Wire.h>
 #include <SPI.h>
@@ -10,18 +5,18 @@
 #include <ESP_FlexyStepper.h> //https://github.com/pkerspe/ESP-FlexyStepper
 
 
-// Motor I/O Pin assignments
-const int MOTOR_STEP_PIN = 26;
-const int MOTOR_DIRECTION_PIN = 33;
-const int LED_PIN = 13;
+// Motor setup
+const int MOTOR_STEP_PIN = 12;
+const int MOTOR_DIRECTION_PIN = 14;
+float motorPosition = 0;
 
-// Thermocouple 
-const int PIN_TC_DO = 19;
+// Thermocouple
+const int PIN_TC_DO = 26;
 const int PIN_TC_CS = 15;
-const int PIN_TC_CLK = 18;
+const int PIN_TC_CLK = 27;
 float tempC = 0;
 Adafruit_MAX31855 TC(PIN_TC_CLK, PIN_TC_CS, PIN_TC_DO);
-const long TCreadSpeed = 1 * pow(10,6);       // Time in microseconds between reading TC
+const long TCreadSpeed = 1 * pow(10, 6);      // Time in microseconds between reading TC
 unsigned long lastTCread;
 
 // Heater PWM setup
@@ -39,14 +34,19 @@ float controlFloat;             // Stores float values
 bool newData = false;        // Stores when new data is read from serial
 bool sendData = false;       // Used as flag to request current status be sent asap
 bool moveStarted = false;     // Flag to know if a move has been started
-const long serialPrintSpeed  = 1 * pow(10,6); // Time in microseconds between printing to serial
-unsigned long lastSerialSent;
+const long serialPrintSpeed  = 2 * pow(10, 6); // Time in microseconds between printing to serial
+unsigned long lastSerialSent = 0;
+const long autoModeSerialPrintSpeed  = 0.5 * pow(10, 6); // Time in microseconds between printing to serial
+unsigned long lastAutoModeSerialSent = 0;
 bool debug = false;
+bool autoMode = false;
 
+// FANUC robot I/O Communication
+const int PINS_ROBO_INPUT[6] = {23, 22, 21, 19, 18, 5};
 
 // Temp controller
 float tSetPoint, Output;
-const int PIN_OUTPUT = 14;
+const int PIN_OUTPUT = 13;
 
 float Kp = 5; // 125  // oldest 25
 float Ki = 2.0; //3        // oldes: 10, old: 0.3
@@ -55,18 +55,18 @@ float Kd = 0.1;        // oldes 0.5
 const int MAX_TEMP  = 250;   // Max temp allowable
 const int MIN_TEMP = 0;     // Min temp allowable
 
-//Specify PID 
+//Specify PID
 QuickPID myPID(&tempC, &Output, &tSetPoint);
 
 // Stepper setup
 ESP_FlexyStepper stepper;
 #define STEPS_PER_MM 393
-
 long acceleration = 100;        // mm/s^2
 long stepperPosition = 0;
 float motorSpeed = 1;          // mm/s
 char movingStatus[10];        // Char array holding "true" or "false"
 
+// ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** *****
 void setup()
 {
 
@@ -92,12 +92,17 @@ void setup()
   stepper.setAccelerationInMillimetersPerSecondPerSecond(acceleration);
   stepper.setDecelerationInMillimetersPerSecondPerSecond(acceleration);
 
+  // Setup Robot I/O Pins
+  for (int i = 0; i < 6; i++) {
+    pinMode(PINS_ROBO_INPUT[i], INPUT_PULLUP);
+  }
 
   // Not start the stepper instance as a service in the "background" as a separate task
   // and the OS of the ESP will take care of invoking the processMovement() task regularily so you can do whatever you want in the loop function
   stepper.startAsService();
 }
 
+// ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** *****
 void loop()
 {
 
@@ -112,7 +117,7 @@ void loop()
     parseData();
   }
 
-  // Turn toggle debug
+  // Toggle debug
   if ((strcmp(controlString, "DEBUG") == 0) && (newData == true)) {
     if (controlFloat == 0) {
       debug = false;
@@ -202,7 +207,7 @@ void loop()
     moveStarted = true;
   }
 
-   // Absolute move motor
+  // Absolute move motor
   if ((strcmp(controlString, "SETTARGET") == 0) && (newData == true)) {
     stepperPosition = controlFloat;
     Serial.print("Moving to position "); Serial.print(controlFloat); Serial.print(" [mm]"); Serial.println("");
@@ -238,6 +243,29 @@ void loop()
     stepper.setTargetPositionToStop();
   }
 
+
+  // Turn on auto mode
+  if ((strcmp(controlString, "AUTO") == 0) && (newData == true)) {
+
+    if (controlFloat == 0) {
+      autoMode = false;
+      Serial.print("Auto Mode Disabled"); Serial.println("");
+    }
+
+    if (controlFloat == 1) {
+      autoMode = true;
+      Serial.print("Auto Mode Enabled"); Serial.println("");
+    }
+
+  }
+
+  // Executes commands for running the stepper motor during auto mode
+  if (autoMode == true) {
+
+    executeAutoMode();
+
+  }
+
   // Read temp sensor every set amount of time
   if ((micros() - lastTCread) > TCreadSpeed) {
     float TCread = TC.readCelsius();
@@ -245,7 +273,7 @@ void loop()
     // Only saves TC value if valid reading taken
     if (!isnan(TCread)) {
       tempC = TCread;
-    } 
+    }
     lastTCread = micros();
   }
 
@@ -258,22 +286,104 @@ void loop()
     Serial.print(" Pos, "); Serial.print(stepper.getCurrentPositionInMillimeters()); Serial.print(", [mm],");
     Serial.print(" Speed, "); Serial.print(motorSpeed); Serial.print(", [mm/s],");
     Serial.print(" Accel, "); Serial.print(acceleration); Serial.print(", [mm/s/s],");
-    Serial.print(" target dist, "); Serial.print((stepper.getDistanceToTargetSigned()/float(STEPS_PER_MM))); Serial.print(", [mm],");
+    Serial.print(" target dist, "); Serial.print((stepper.getDistanceToTargetSigned() / float(STEPS_PER_MM))); Serial.print(", [mm],");
     Serial.println("");
     lastSerialSent = micros();
     sendData = false;
   }
 
-  // compute PID
+  // compute temperature PID
   myPID.Compute();
 
   // Write to temp output channel
   ledcWrite(PWMChannel, Output);
 
-  delay(100);
+  delay(50);
   newData = false;
 }
 
+
+// ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** *****
+// Function to execute auto mode of reading FANUC robot input, and setting stepper speed based on input
+void executeAutoMode() {
+
+  bool sendSerial = false;
+  float mappedSpeed = 0;
+  int robotInputs[6] = {0, 0, 0, 0, 0, 0};
+  int robotInput = 0;
+
+  // Check if should send serial info
+  if ((micros() - lastAutoModeSerialSent) >= autoModeSerialPrintSpeed) {
+    sendSerial = true;
+    lastAutoModeSerialSent = micros();
+  }
+
+  if (sendSerial) {
+    Serial.print("Input Pin State: ");
+  }
+
+  // Read Robot input pins
+  for (int i = 0; i < 6; i++) {
+    int temp = digitalRead(PINS_ROBO_INPUT[i]);
+    if (sendSerial) {
+      Serial.print(temp);
+    }
+    robotInputs[i] = temp;
+    robotInput += temp * pow(2, i);
+  }
+
+  if (sendSerial) {
+    Serial.print(", Input (dec): "); Serial.print(robotInput);
+  }
+
+  // Set extruder rate based on read value
+  // If zero, set zero
+  if (robotInput == 0) {
+    stepper.setTargetPositionToStop();
+    if (sendSerial) {
+      Serial.print(", [auto] Stopping Extrusion"); Serial.println("");
+    }
+    return;
+  }
+
+  // If low range, map to range
+  else if (robotInput < 5) {
+    mappedSpeed = mapf(robotInput, 1, 4, -15, -1);
+  }
+
+  // If main range, map to range
+  else if (robotInput < 55) {
+    mappedSpeed = mapf(robotInput, 5, 54, -1, 10);
+  }
+
+  // If upper range, map to range
+  else if (robotInput <= 63) {
+    mappedSpeed = mapf(robotInput, 55, 63, 10, 30);
+  }
+
+  motorSpeed = mappedSpeed;
+
+  // Execute motion by setting speed, and incrementing relative movement is close to finished
+
+  // Set speed
+  stepper.setSpeedInMillimetersPerSecond(abs(motorSpeed));
+
+  // Set target location based on offset in correct direciton (dir) from current location
+  if (tempC > 180) {
+    motorPosition = stepper.getCurrentPositionInMillimeters();
+    stepper.setTargetPositionInMillimeters(motorPosition + 10 * motorSpeed / abs(motorSpeed));
+  }
+  else {
+    if (sendSerial) {
+      Serial.print(", Temperature too low to auto extrude");
+    }
+  }
+  if (sendSerial) {
+    Serial.print(", Extrusion speed: "); Serial.print(motorSpeed); Serial.print(", Current pos: "); Serial.print(motorPosition); Serial.print(", Target pos: "); Serial.print(motorPosition + 10 * motorSpeed / abs(motorSpeed));
+    Serial.println("");
+  }
+
+}
 
 // ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** *****
 // Copied from: https://forum.arduino.cc/index.php?topic=396450
@@ -345,8 +455,16 @@ void parseData() {      // split the data into its parts
     }
   }
 
+
   // Otherwise, set control float to zero
   else {
     controlFloat = 0;
   }
+}
+
+// ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** ***** *****
+// Custom map function to allow mapping with floats, taken from : https://forum.arduino.cc/index.php?topic=361046.0
+double mapf(double x, double in_min, double in_max, double out_min, double out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }

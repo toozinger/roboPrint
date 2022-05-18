@@ -120,19 +120,22 @@ def erateMap(eRate, lineNum):
     
     # Ranges: -20mm/s -10mm/s -5mm/s
     
-    # Main Range
-    if eRate >= mRateMin and eRate <= mRateMax:
+    # Stopped
+    if eRate == 0:
+        eRateMapped = 0
+    
+    # Main range: 1 >> 10 map to 5 >> 54
+    elif eRate >= mRateMin and eRate <= mRateMax:
         eRateMapped = lowRangeSteps + int((eRate - mRateMin)/(mRateMax - mRateMin)*mainRangeSteps)
         
-    # Low Range
+    # Low Range: -15 >> 1 map to 1 >> 4
     elif eRate < mRateMin:
         if eRate < lRateMin:
             eRateMapped = 1
         else:
             eRateMapped = 1 + int(round((eRate - lRateMin)/(lRateMax - lRateMin)*lowRangeSteps))
         
-    # High Range
-     # Low Range
+    # High Range: 10 >> 30 map to 55 >> 63
     elif eRate > mRateMax:
         if eRate > hRateMax: 
             eRateMapped = totRangeSteps
@@ -187,6 +190,11 @@ while i < len(newProg):
         
         # print(f"Line {i}, Pos {posNum}, move dist {moveDist}, move rate {moveRate}, eDist {eDist}, eRate {eRate}, eRateCommand {eRateCommand}")
         
+    # If the next movement is not an extrusion, send a zero eRate output
+    elif "P[" in newProg[i]:
+        eRate = 0; eRates.append(eRate)
+        eRateCommand = erateMap(eRate, i)
+        newProg.insert(i+1, eRateCommand)
     
     # Exit loop early cause testing
     if i > iMax: 
